@@ -1,0 +1,2 @@
+"""OCRShot package."""
+
