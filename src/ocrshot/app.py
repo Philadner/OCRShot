@@ -46,6 +46,7 @@ else:  # pragma: no cover - this app is intentionally Windows-only.
 APP_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "Philadner" / "OCRShot"
 SCREENSHOT_DIR = APP_DIR / "Screenshots"
 CONFIG_PATH = APP_DIR / "config.json"
+OCR_METADATA_VERSION = 1
 
 GA_ROOT = 2
 PW_RENDERFULLCONTENT = 0x00000002
@@ -370,10 +371,47 @@ def safe_filename_piece(value: str) -> str:
     return cleaned.strip("._")[:48] or "window"
 
 
+def ocr_metadata_path(image_path: Path) -> Path:
+    return image_path.with_suffix(image_path.suffix + ".ocr.json")
+
+
+def write_ocr_metadata(image_path: Path, text: str, window_title: str = "") -> None:
+    metadata = {
+        "version": OCR_METADATA_VERSION,
+        "image": image_path.name,
+        "window_title": window_title,
+        "ocr_text": text,
+        "indexed_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    ocr_metadata_path(image_path).write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+
+def read_ocr_metadata(image_path: Path) -> dict[str, Any]:
+    path = ocr_metadata_path(image_path)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def read_ocr_text(image_path: Path) -> str:
+    data = read_ocr_metadata(image_path)
+    text = data.get("ocr_text", "")
+    return text if isinstance(text, str) else ""
+
+
+def screenshot_has_ocr_data(image_path: Path) -> bool:
+    return "ocr_text" in read_ocr_metadata(image_path)
+
+
 class MonitorBridge(QObject):
     completed = Signal(str, str, str)
     failed = Signal(str)
     preview_ready = Signal(object)
+    ocr_index_updated = Signal(str)
 
 
 class SelectionOverlay(QWidget):
@@ -870,6 +908,7 @@ class HistoryPanel(SquircleFrame):
     previousClicked = Signal()
     nextClicked = Signal()
     deleteClicked = Signal()
+    searchChanged = Signal(str)
 
     def __init__(self) -> None:
         super().__init__()
@@ -877,6 +916,8 @@ class HistoryPanel(SquircleFrame):
         self._pixmap: QPixmap | None = None
         self.title = QLabel("Screenshot history")
         self.title.setObjectName("historyTitle")
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Search OCR text")
 
         self.image = QLabel("No screenshots yet")
         self.image.setObjectName("historyImage")
@@ -903,6 +944,7 @@ class HistoryPanel(SquircleFrame):
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(8)
         layout.addWidget(self.title)
+        layout.addWidget(self.search_input)
         layout.addWidget(self.image, 1)
         layout.addLayout(nav)
         layout.addWidget(self.delete_button)
@@ -910,8 +952,9 @@ class HistoryPanel(SquircleFrame):
         self.previous_button.clicked.connect(self.previousClicked.emit)
         self.next_button.clicked.connect(self.nextClicked.emit)
         self.delete_button.clicked.connect(self.deleteClicked.emit)
+        self.search_input.textChanged.connect(self.searchChanged.emit)
 
-    def set_history_state(self, current: int, total: int, path: Path | None) -> None:
+    def set_history_state(self, current: int, total: int, path: Path | None, empty_message: str = "No screenshots yet") -> None:
         self.counter.setText(f"{current} / {total}")
         self.previous_button.setEnabled(total > 1)
         self.next_button.setEnabled(total > 1)
@@ -919,7 +962,7 @@ class HistoryPanel(SquircleFrame):
         if path is None:
             self._pixmap = None
             self.image.setPixmap(QPixmap())
-            self.image.setText("No screenshots yet")
+            self.image.setText(empty_message)
             return
 
         pixmap = QPixmap(str(path))
@@ -963,6 +1006,9 @@ class MainWindow(QMainWindow):
         self.history_open = False
         self.history_files: list[Path] = []
         self.history_index = 0
+        self.history_search_query = ""
+        self.ocr_backfill_busy = False
+        self.ocr_lock = threading.Lock()
         self.window_geometry_animation: QPropertyAnimation | None = None
         self.compact_geometry: QRect | None = None
         self.compact_left_width = 460
@@ -1056,6 +1102,7 @@ class MainWindow(QMainWindow):
         self.history_panel.previousClicked.connect(self.show_previous_history)
         self.history_panel.nextClicked.connect(self.show_next_history)
         self.history_panel.deleteClicked.connect(self.delete_current_history)
+        self.history_panel.searchChanged.connect(self.search_history)
         self.word_field.textChanged.connect(lambda _text: self.persist_config())
         self.interval_input.valueChanged.connect(lambda _value: self.persist_config())
         self.cooldown_input.valueChanged.connect(lambda _value: self.persist_config())
@@ -1063,6 +1110,7 @@ class MainWindow(QMainWindow):
         self.bridge.completed.connect(self.handle_scan_completed)
         self.bridge.failed.connect(self.handle_scan_failed)
         self.bridge.preview_ready.connect(self.update_preview_from_image)
+        self.bridge.ocr_index_updated.connect(self.handle_ocr_index_updated)
         self.selection_overlay.selected.connect(self.complete_window_selection)
         self.selection_overlay.canceled.connect(self.cancel_window_selection)
         self.window_panel.resized.connect(self.resize_to_content)
@@ -1071,6 +1119,7 @@ class MainWindow(QMainWindow):
         self.refresh_window_label()
         self.statusBar().showMessage(f"Screenshots: {SCREENSHOT_DIR}")
         QTimer.singleShot(0, self.resize_to_content)
+        QTimer.singleShot(800, self.start_ocr_backfill)
 
     def apply_theme(self) -> None:
         accent = self.accent_color
@@ -1215,7 +1264,16 @@ class MainWindow(QMainWindow):
         return sorted(SCREENSHOT_DIR.glob("*.png"), key=lambda path: path.stat().st_mtime, reverse=True)
 
     def refresh_history(self, preferred_path: Path | None = None) -> None:
-        self.history_files = self.screenshot_history_files()
+        files = self.screenshot_history_files()
+        query = self.history_search_query.strip().lower()
+        if query:
+            terms = [term for term in query.split() if term]
+            files = [
+                path
+                for path in files
+                if all(term in read_ocr_text(path).lower() for term in terms)
+            ]
+        self.history_files = files
         if preferred_path and preferred_path in self.history_files:
             self.history_index = self.history_files.index(preferred_path)
         elif self.history_files:
@@ -1227,10 +1285,56 @@ class MainWindow(QMainWindow):
     def update_history_view(self) -> None:
         total = len(self.history_files)
         if not total:
-            self.history_panel.set_history_state(0, 0, None)
+            message = "No OCR matches" if self.history_search_query.strip() else "No screenshots yet"
+            self.history_panel.set_history_state(0, 0, None, message)
             return
         current_path = self.history_files[self.history_index]
         self.history_panel.set_history_state(self.history_index + 1, total, current_path)
+
+    def search_history(self, query: str) -> None:
+        self.history_search_query = query
+        self.history_index = 0
+        self.refresh_history()
+
+    def screenshots_missing_ocr_data(self) -> list[Path]:
+        return [path for path in self.screenshot_history_files() if not screenshot_has_ocr_data(path)]
+
+    def start_ocr_backfill(self) -> None:
+        if self.ocr_backfill_busy:
+            return
+        missing = self.screenshots_missing_ocr_data()
+        if not missing:
+            return
+        self.ocr_backfill_busy = True
+        threading.Thread(target=self.ocr_backfill_worker, args=(missing,), daemon=True).start()
+
+    def ocr_backfill_worker(self, files: list[Path]) -> None:
+        indexed = 0
+        try:
+            for path in files:
+                if not path.exists() or screenshot_has_ocr_data(path):
+                    continue
+                try:
+                    with Image.open(path) as image:
+                        with self.ocr_lock:
+                            text = self.ocr.read_text(image)
+                    write_ocr_metadata(path, text)
+                    indexed += 1
+                except Exception:
+                    continue
+        finally:
+            self.ocr_backfill_busy = False
+            self.bridge.ocr_index_updated.emit(str(indexed))
+
+    def handle_ocr_index_updated(self, indexed_text: str) -> None:
+        try:
+            indexed = int(indexed_text)
+        except ValueError:
+            indexed = 0
+        if self.history_open:
+            self.refresh_history()
+        if indexed:
+            self.statusBar().showMessage(f"OCR indexed {indexed} screenshot{'s' if indexed != 1 else ''}.")
 
     def toggle_history(self) -> None:
         if self.history_open:
@@ -1330,6 +1434,9 @@ class MainWindow(QMainWindow):
         path = self.history_files[self.history_index]
         try:
             path.unlink()
+            metadata_path = ocr_metadata_path(path)
+            if metadata_path.exists():
+                metadata_path.unlink()
         except OSError as exc:
             QMessageBox.critical(self, "OCRShot", f"Could not delete screenshot:\n{exc}")
             return
@@ -1457,26 +1564,29 @@ class MainWindow(QMainWindow):
         try:
             image = capture_window(hwnd)
             self.bridge.preview_ready.emit(image.copy())
-            text = self.ocr.read_text(image)
+            with self.ocr_lock:
+                text = self.ocr.read_text(image)
             matched = contains_word(text, word, match_case)
             now = time.monotonic()
             should_save = matched and (not self.last_had_match or now - self.last_trigger_at >= cooldown)
             screenshot_path = ""
             if should_save:
-                screenshot_path = self.save_screenshot_image(image, word)
+                screenshot_path = self.save_screenshot_image(image, word, text)
                 self.last_trigger_at = now
             self.last_had_match = matched
             self.bridge.completed.emit(text, screenshot_path, "")
         except Exception as exc:
             self.bridge.failed.emit(str(exc))
 
-    def save_screenshot_image(self, image: Image.Image, word: str) -> str:
+    def save_screenshot_image(self, image: Image.Image, word: str, ocr_text: str = "") -> str:
         ensure_app_dirs()
         window_title = get_window_title(self.selected_hwnd) if self.selected_hwnd else "window"
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"{timestamp}_{safe_filename_piece(window_title)}_{safe_filename_piece(word)}.png"
         path = SCREENSHOT_DIR / filename
         image.save(path)
+        if ocr_text:
+            write_ocr_metadata(path, ocr_text, window_title)
         return str(path)
 
     def save_manual_capture(self) -> None:
@@ -1489,6 +1599,7 @@ class MainWindow(QMainWindow):
             self.update_preview_from_image(image)
             if self.history_open:
                 self.refresh_history(Path(path))
+            self.start_ocr_backfill()
         except Exception as exc:
             QMessageBox.critical(self, "OCRShot", str(exc))
             return
