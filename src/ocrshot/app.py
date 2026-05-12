@@ -768,6 +768,17 @@ class RightClickableButton(QPushButton):
         super().mousePressEvent(event)
 
 
+class ClickableImageLabel(QLabel):
+    clicked = Signal()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+
 class LabeledLineEdit(SquircleFrame):
     textChanged = Signal(str)
 
@@ -1115,6 +1126,7 @@ class HistoryPanel(SquircleFrame):
     nextClicked = Signal()
     deleteClicked = Signal()
     searchChanged = Signal(str)
+    imageClicked = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -1125,10 +1137,11 @@ class HistoryPanel(SquircleFrame):
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Search OCR text")
 
-        self.image = QLabel("No screenshots yet")
+        self.image = ClickableImageLabel("No screenshots yet")
         self.image.setObjectName("historyImage")
         self.image.setAlignment(Qt.AlignCenter)
         self.image.setMinimumSize(420, 260)
+        self.image.setCursor(Qt.PointingHandCursor)
 
         self.counter = QLabel("0 / 0")
         self.counter.setAlignment(Qt.AlignCenter)
@@ -1159,6 +1172,7 @@ class HistoryPanel(SquircleFrame):
         self.next_button.clicked.connect(self.nextClicked.emit)
         self.delete_button.clicked.connect(self.deleteClicked.emit)
         self.search_input.textChanged.connect(self.searchChanged.emit)
+        self.image.clicked.connect(self.imageClicked.emit)
 
     def set_history_state(self, current: int, total: int, path: Path | None, empty_message: str = "No screenshots yet") -> None:
         self.counter.setText(f"{current} / {total}")
@@ -1325,6 +1339,7 @@ class MainWindow(QMainWindow):
         self.history_panel.nextClicked.connect(self.show_next_history)
         self.history_panel.deleteClicked.connect(self.delete_current_history)
         self.history_panel.searchChanged.connect(self.search_history)
+        self.history_panel.imageClicked.connect(self.open_current_history_image)
         self.word_field.textChanged.connect(lambda _text: self.persist_config())
         self.interval_input.valueChanged.connect(lambda _value: self.persist_config())
         self.cooldown_input.valueChanged.connect(lambda _value: self.persist_config())
@@ -1651,6 +1666,18 @@ class MainWindow(QMainWindow):
             return
         self.history_index = (self.history_index + 1) % len(self.history_files)
         self.update_history_view()
+
+    def open_current_history_image(self) -> None:
+        if not self.history_files:
+            return
+        path = self.history_files[self.history_index]
+        if not path.exists():
+            self.refresh_history()
+            return
+        try:
+            os.startfile(path)  # type: ignore[attr-defined]
+        except OSError as exc:
+            QMessageBox.warning(self, "OCRShot", f"Could not open screenshot:\n{exc}")
 
     def delete_current_history(self) -> None:
         if not self.history_files:
