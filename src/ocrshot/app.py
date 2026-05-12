@@ -47,6 +47,11 @@ APP_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "Philadner" / "OCR
 SCREENSHOT_DIR = APP_DIR / "Screenshots"
 CONFIG_PATH = APP_DIR / "config.json"
 OCR_METADATA_VERSION = 1
+OCR_TILE_GRID = 4
+OCR_TILE_FINGERPRINT_SIZE = 16
+OCR_TILE_PADDING = 32
+OCR_TILE_CHANGE_THRESHOLD = 4.0
+OCR_MAX_INCREMENTAL_TILES = 8
 
 GA_ROOT = 2
 PW_RENDERFULLCONTENT = 0x00000002
@@ -155,6 +160,15 @@ class AppConfig:
     scan_interval_seconds: float = 3.0
     trigger_cooldown_seconds: float = 10.0
     match_case: bool = False
+
+
+@dataclass
+class TileOcrCache:
+    image_size: tuple[int, int] | None = None
+    fingerprints: list[np.ndarray] | None = None
+    tile_texts: list[str] | None = None
+    combined_text: str = ""
+    tile_cache_valid: bool = False
 
 
 def ensure_app_dirs() -> None:
@@ -315,9 +329,46 @@ def capture_window(hwnd: int) -> Image.Image:
         win32gui.ReleaseDC(hwnd, window_dc)
 
 
+def tile_boxes(size: tuple[int, int], grid: int = OCR_TILE_GRID) -> list[tuple[int, int, int, int]]:
+    width, height = size
+    boxes: list[tuple[int, int, int, int]] = []
+    for row in range(grid):
+        top = round(row * height / grid)
+        bottom = round((row + 1) * height / grid)
+        for col in range(grid):
+            left = round(col * width / grid)
+            right = round((col + 1) * width / grid)
+            boxes.append((left, top, right, bottom))
+    return boxes
+
+
+def padded_box(box: tuple[int, int, int, int], size: tuple[int, int], padding: int = OCR_TILE_PADDING) -> tuple[int, int, int, int]:
+    width, height = size
+    left, top, right, bottom = box
+    return (
+        max(0, left - padding),
+        max(0, top - padding),
+        min(width, right + padding),
+        min(height, bottom + padding),
+    )
+
+
+def tile_fingerprint(image: Image.Image, box: tuple[int, int, int, int]) -> np.ndarray:
+    crop = image.crop(box).convert("L").resize(
+        (OCR_TILE_FINGERPRINT_SIZE, OCR_TILE_FINGERPRINT_SIZE),
+        Image.Resampling.BILINEAR,
+    )
+    return np.asarray(crop, dtype=np.int16)
+
+
+def tile_difference(previous: np.ndarray, current: np.ndarray) -> float:
+    return float(np.mean(np.abs(current - previous)))
+
+
 class OcrEngine:
     def __init__(self) -> None:
         self._engine: Any | None = None
+        self.provider_label = "unloaded"
 
     def _load(self) -> Any:
         if self._engine is not None:
@@ -326,8 +377,47 @@ class OcrEngine:
             from rapidocr_onnxruntime import RapidOCR
         except ImportError as exc:
             raise RuntimeError("rapidocr-onnxruntime is not installed. Run `uv sync`.") from exc
-        self._engine = RapidOCR()
+
+        use_cuda = False
+        try:
+            import onnxruntime as ort
+
+            use_cuda = "CUDAExecutionProvider" in ort.get_available_providers()
+        except Exception:
+            use_cuda = False
+
+        if use_cuda and self.has_cuda_runtime_dlls():
+            try:
+                self._engine = RapidOCR(
+                    det_use_cuda=True,
+                    cls_use_cuda=True,
+                    rec_use_cuda=True,
+                    print_verbose=False,
+                )
+                self.provider_label = self.active_provider_label(self._engine)
+                return self._engine
+            except Exception:
+                self._engine = None
+
+        self._engine = RapidOCR(print_verbose=False)
+        self.provider_label = self.active_provider_label(self._engine)
         return self._engine
+
+    def has_cuda_runtime_dlls(self) -> bool:
+        required = ("cublasLt64_12.dll", "cudnn64_9.dll")
+        path_dirs = [Path(path) for path in os.environ.get("PATH", "").split(os.pathsep) if path]
+        return all(any((path_dir / dll).exists() for path_dir in path_dirs) for dll in required)
+
+    def active_provider_label(self, engine: Any) -> str:
+        try:
+            providers = engine.text_rec.infer.session.get_providers()
+        except Exception:
+            return "CPU"
+        if providers and providers[0] == "CUDAExecutionProvider":
+            return "CUDA"
+        if providers:
+            return providers[0].replace("ExecutionProvider", "")
+        return "CPU"
 
     def read_text(self, image: Image.Image) -> str:
         engine = self._load()
@@ -1000,6 +1090,7 @@ class MainWindow(QMainWindow):
         self.scan_busy = False
         self.last_trigger_at = 0.0
         self.last_had_match = False
+        self.tile_ocr_cache = TileOcrCache()
         self.selection_overlay = SelectionOverlay()
         self.taskbar = TaskbarProgress()
         self.accent_color = get_windows_accent_color()
@@ -1476,6 +1567,7 @@ class MainWindow(QMainWindow):
         self.setWindowState(self.windowState() & ~Qt.WindowMinimized)
         self.activateWindow()
         self.selected_hwnd = hwnd
+        self.reset_ocr_scan_cache()
         self.persist_config()
         self.refresh_window_label()
         try:
@@ -1488,6 +1580,9 @@ class MainWindow(QMainWindow):
         self.setWindowState(self.windowState() & ~Qt.WindowMinimized)
         self.activateWindow()
         self.statusBar().showMessage("Window selection canceled.")
+
+    def reset_ocr_scan_cache(self) -> None:
+        self.tile_ocr_cache = TileOcrCache()
 
     def showEvent(self, event: Any) -> None:
         super().showEvent(event)
@@ -1560,12 +1655,62 @@ class MainWindow(QMainWindow):
         cooldown = self.cooldown_input.value()
         threading.Thread(target=self.scan_once, args=(hwnd, word, match_case, cooldown), daemon=True).start()
 
+    def ocr_crop_text(self, image: Image.Image, box: tuple[int, int, int, int]) -> str:
+        crop = image.crop(box)
+        with self.ocr_lock:
+            return self.ocr.read_text(crop)
+
+    def ocr_all_tiles(self, image: Image.Image, boxes: list[tuple[int, int, int, int]]) -> list[str]:
+        size = image.size
+        return [self.ocr_crop_text(image, padded_box(box, size)) for box in boxes]
+
+    def read_text_optimized(self, image: Image.Image) -> tuple[str, str, int]:
+        size = image.size
+        boxes = tile_boxes(size)
+        fingerprints = [tile_fingerprint(image, box) for box in boxes]
+        cache = self.tile_ocr_cache
+
+        if cache.image_size != size or cache.fingerprints is None:
+            changed_indices = list(range(len(boxes)))
+            cache.tile_cache_valid = False
+        else:
+            changed_indices = [
+                index
+                for index, (previous, current) in enumerate(zip(cache.fingerprints, fingerprints, strict=True))
+                if tile_difference(previous, current) >= OCR_TILE_CHANGE_THRESHOLD
+            ]
+
+        if not changed_indices:
+            cache.fingerprints = fingerprints
+            return cache.combined_text, "unchanged", 0
+
+        if not cache.tile_cache_valid or cache.tile_texts is None or len(changed_indices) > OCR_MAX_INCREMENTAL_TILES:
+            tile_texts = self.ocr_all_tiles(image, boxes)
+            text = "\n".join(text for text in tile_texts if text.strip())
+            cache.image_size = size
+            cache.fingerprints = fingerprints
+            cache.tile_texts = tile_texts
+            cache.combined_text = text
+            cache.tile_cache_valid = True
+            return text, "rebuilt", len(changed_indices)
+
+        tile_texts = list(cache.tile_texts)
+        for index in changed_indices:
+            tile_texts[index] = self.ocr_crop_text(image, padded_box(boxes[index], size))
+
+        text = "\n".join(text for text in tile_texts if text.strip())
+        cache.image_size = size
+        cache.fingerprints = fingerprints
+        cache.tile_texts = tile_texts
+        cache.combined_text = text
+        cache.tile_cache_valid = True
+        return text, "tiles", len(changed_indices)
+
     def scan_once(self, hwnd: int, word: str, match_case: bool, cooldown: int) -> None:
         try:
             image = capture_window(hwnd)
             self.bridge.preview_ready.emit(image.copy())
-            with self.ocr_lock:
-                text = self.ocr.read_text(image)
+            text, scan_mode, changed_count = self.read_text_optimized(image)
             matched = contains_word(text, word, match_case)
             now = time.monotonic()
             should_save = matched and (not self.last_had_match or now - self.last_trigger_at >= cooldown)
@@ -1574,18 +1719,18 @@ class MainWindow(QMainWindow):
                 screenshot_path = self.save_screenshot_image(image, word, text)
                 self.last_trigger_at = now
             self.last_had_match = matched
-            self.bridge.completed.emit(text, screenshot_path, "")
+            self.bridge.completed.emit(text, screenshot_path, f"{scan_mode}:{changed_count}:{self.ocr.provider_label}")
         except Exception as exc:
             self.bridge.failed.emit(str(exc))
 
-    def save_screenshot_image(self, image: Image.Image, word: str, ocr_text: str = "") -> str:
+    def save_screenshot_image(self, image: Image.Image, word: str, ocr_text: str | None = None) -> str:
         ensure_app_dirs()
         window_title = get_window_title(self.selected_hwnd) if self.selected_hwnd else "window"
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"{timestamp}_{safe_filename_piece(window_title)}_{safe_filename_piece(word)}.png"
         path = SCREENSHOT_DIR / filename
         image.save(path)
-        if ocr_text:
+        if ocr_text is not None:
             write_ocr_metadata(path, ocr_text, window_title)
         return str(path)
 
@@ -1612,13 +1757,32 @@ class MainWindow(QMainWindow):
 
     def handle_scan_completed(self, text: str, screenshot_path: str, selected_hwnd: str) -> None:
         self.scan_busy = False
+        scan_mode, changed_count, provider = self.parse_scan_status(selected_hwnd)
         if screenshot_path:
             if self.history_open:
                 self.refresh_history(Path(screenshot_path))
             self.statusBar().showMessage(f"Match found. Saved {screenshot_path}")
         else:
             fragment_count = len([line for line in text.splitlines() if line.strip()])
-            self.statusBar().showMessage(f"Scanned window. OCR text fragments: {fragment_count}")
+            if scan_mode == "unchanged":
+                self.statusBar().showMessage(f"Skipped OCR; window unchanged. Cached text fragments: {fragment_count}")
+            elif scan_mode == "tiles":
+                self.statusBar().showMessage(f"OCR {changed_count} changed tile{'s' if changed_count != 1 else ''} on {provider}. Text fragments: {fragment_count}")
+            elif scan_mode == "rebuilt":
+                self.statusBar().showMessage(f"OCR cache rebuilt on {provider}. Changed tiles: {changed_count}. Text fragments: {fragment_count}")
+            else:
+                self.statusBar().showMessage(f"Scanned window. OCR text fragments: {fragment_count}")
+
+    def parse_scan_status(self, status: str) -> tuple[str, int, str]:
+        parts = status.split(":")
+        if len(parts) != 3:
+            return "", 0, self.ocr.provider_label
+        mode, count_text, provider = parts
+        try:
+            count = int(count_text)
+        except ValueError:
+            count = 0
+        return mode, count, provider
 
     def handle_scan_failed(self, message: str) -> None:
         self.scan_busy = False

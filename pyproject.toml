@@ -10,6 +10,7 @@ dependencies = [
     "pywin32>=308; sys_platform == 'win32'",
     "PySide6>=6.8",
     "rapidocr-onnxruntime>=1.4",
+    "onnxruntime-gpu>=1.26.0",
 ]
 
 [project.scripts]
