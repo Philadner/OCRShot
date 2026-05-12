@@ -17,7 +17,7 @@ from typing import Any
 import numpy as np
 from PIL import Image
 from PySide6.QtCore import QEasingCurve, QObject, Property, QPropertyAnimation, QRect, QSize, QTimer, Qt, Signal
-from PySide6.QtGui import QColor, QDoubleValidator, QImage, QMouseEvent, QPainter, QPalette, QPen, QPixmap
+from PySide6.QtGui import QColor, QDoubleValidator, QImage, QImageReader, QMouseEvent, QPainter, QPalette, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -54,6 +54,7 @@ OCR_TILE_CHANGE_THRESHOLD = 4.0
 OCR_MAX_INCREMENTAL_TILES = 8
 PREVIEW_MAX_SIZE = QSize(520, 260)
 PREVIEW_UPDATE_INTERVAL_SECONDS = 1.0
+HISTORY_PREVIEW_MAX_SIZE = QSize(1100, 720)
 
 GA_ROOT = 2
 PW_RENDERFULLCONTENT = 0x00000002
@@ -1132,6 +1133,7 @@ class HistoryPanel(SquircleFrame):
         super().__init__()
         self.setObjectName("historyPanel")
         self._pixmap: QPixmap | None = None
+        self._source_path: Path | None = None
         self.title = QLabel("Screenshot history")
         self.title.setObjectName("historyTitle")
         self.search_input = QLineEdit()
@@ -1181,12 +1183,13 @@ class HistoryPanel(SquircleFrame):
         self.delete_button.setEnabled(path is not None)
         if path is None:
             self._pixmap = None
+            self._source_path = None
             self.image.setPixmap(QPixmap())
             self.image.setText(empty_message)
             return
 
-        pixmap = QPixmap(str(path))
-        self._pixmap = pixmap if not pixmap.isNull() else None
+        self._source_path = path
+        self._pixmap = self.load_preview_pixmap(path)
         if self._pixmap is None:
             self.image.setPixmap(QPixmap())
             self.image.setText("Could not load screenshot")
@@ -1201,12 +1204,25 @@ class HistoryPanel(SquircleFrame):
     def update_pixmap(self) -> None:
         if self._pixmap is None:
             return
+        target_size = QSize(max(1, self.image.width() - 12), max(1, self.image.height() - 12))
         scaled = self._pixmap.scaled(
-            QSize(max(1, self.image.width() - 12), max(1, self.image.height() - 12)),
+            target_size,
             Qt.KeepAspectRatio,
-            Qt.SmoothTransformation,
+            Qt.FastTransformation,
         )
         self.image.setPixmap(scaled)
+
+    def load_preview_pixmap(self, path: Path) -> QPixmap | None:
+        reader = QImageReader(str(path))
+        reader.setAutoTransform(True)
+        source_size = reader.size()
+        if source_size.isValid():
+            scaled_size = source_size.scaled(HISTORY_PREVIEW_MAX_SIZE, Qt.KeepAspectRatio)
+            reader.setScaledSize(scaled_size)
+        image = reader.read()
+        if image.isNull():
+            return None
+        return QPixmap.fromImage(image)
 
 
 class MainWindow(QMainWindow):
