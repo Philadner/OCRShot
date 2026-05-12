@@ -52,6 +52,8 @@ OCR_TILE_FINGERPRINT_SIZE = 16
 OCR_TILE_PADDING = 32
 OCR_TILE_CHANGE_THRESHOLD = 4.0
 OCR_MAX_INCREMENTAL_TILES = 8
+PREVIEW_MAX_SIZE = QSize(520, 260)
+PREVIEW_UPDATE_INTERVAL_SECONDS = 1.0
 
 GA_ROOT = 2
 PW_RENDERFULLCONTENT = 0x00000002
@@ -321,7 +323,7 @@ def capture_window(hwnd: int) -> Image.Image:
     memory_dc = source_dc.CreateCompatibleDC()
     bitmap = win32ui.CreateBitmap()
     bitmap.CreateCompatibleBitmap(source_dc, width, height)
-    memory_dc.SelectObject(bitmap)
+    previous_bitmap = memory_dc.SelectObject(bitmap)
 
     try:
         result = ctypes.windll.user32.PrintWindow(hwnd, memory_dc.GetSafeHdc(), PW_RENDERFULLCONTENT)
@@ -341,6 +343,10 @@ def capture_window(hwnd: int) -> Image.Image:
         )
         return image.copy()
     finally:
+        try:
+            memory_dc.SelectObject(previous_bitmap)
+        except Exception:
+            pass
         win32gui.DeleteObject(bitmap.GetHandle())
         memory_dc.DeleteDC()
         source_dc.DeleteDC()
@@ -720,6 +726,15 @@ def image_to_qimage(image: Image.Image) -> QImage:
     data = rgb.tobytes("raw", "RGBA")
     qimage = QImage(data, rgb.width, rgb.height, QImage.Format_RGBA8888)
     return qimage.copy()
+
+
+def image_to_preview_qimage(image: Image.Image) -> QImage:
+    preview = image.copy()
+    preview.thumbnail((PREVIEW_MAX_SIZE.width(), PREVIEW_MAX_SIZE.height()), Image.Resampling.BILINEAR)
+    try:
+        return image_to_qimage(preview)
+    finally:
+        preview.close()
 
 
 def image_to_pixmap(image: Image.Image) -> QPixmap:
@@ -1193,6 +1208,7 @@ class MainWindow(QMainWindow):
         self.last_trigger_at = 0.0
         self.last_had_match = False
         self.last_snapshot_image: Image.Image | None = None
+        self.last_preview_emit_at = 0.0
         self.last_external_foreground_hwnd: int | None = None
         self.selection_purpose = "monitor"
         self.tile_ocr_cache = TileOcrCache()
@@ -1205,6 +1221,7 @@ class MainWindow(QMainWindow):
         self.history_search_query = ""
         self.ocr_backfill_busy = False
         self.ocr_lock = threading.Lock()
+        self.snapshot_lock = threading.Lock()
         self.window_geometry_animation: QPropertyAnimation | None = None
         self.compact_geometry: QRect | None = None
         self.compact_left_width = 460
@@ -1314,7 +1331,7 @@ class MainWindow(QMainWindow):
         self.match_case_switch.toggled.connect(lambda _checked: self.persist_config())
         self.bridge.completed.connect(self.handle_scan_completed)
         self.bridge.failed.connect(self.handle_scan_failed)
-        self.bridge.preview_ready.connect(self.update_preview_from_image)
+        self.bridge.preview_ready.connect(self.update_preview_from_qimage)
         self.bridge.ocr_index_updated.connect(self.handle_ocr_index_updated)
         self.selection_overlay.selected.connect(self.complete_window_selection)
         self.selection_overlay.canceled.connect(self.cancel_window_selection)
@@ -1719,7 +1736,10 @@ class MainWindow(QMainWindow):
         self.persist_config()
         self.refresh_window_label()
         try:
-            self.update_preview_from_image(capture_window(hwnd))
+            image = capture_window(hwnd)
+            self.set_last_snapshot(image)
+            self.update_preview_from_image(image)
+            image.close()
         except Exception:
             pass
         self.statusBar().showMessage("Window selected.")
@@ -1748,7 +1768,8 @@ class MainWindow(QMainWindow):
             self.last_external_foreground_hwnd = hwnd
 
     def send_last_snapshot_to_chatgpt(self) -> None:
-        if self.last_snapshot_image is None:
+        snapshot = self.copy_last_snapshot()
+        if snapshot is None:
             QMessageBox.warning(self, "OCRShot", "No analyzed snapshot is available yet.")
             return
 
@@ -1762,7 +1783,8 @@ class MainWindow(QMainWindow):
         if not return_hwnd or return_hwnd == self.chatgpt_hwnd or not win32gui.IsWindow(return_hwnd):
             return_hwnd = int(self.winId())
 
-        QApplication.clipboard().setImage(image_to_qimage(self.last_snapshot_image))
+        QApplication.clipboard().setImage(image_to_qimage(snapshot))
+        snapshot.close()
         if not activate_window(self.chatgpt_hwnd):
             QMessageBox.warning(self, "OCRShot", "Could not focus the selected ChatGPT window.")
             return
@@ -1790,6 +1812,27 @@ class MainWindow(QMainWindow):
     def reset_ocr_scan_cache(self) -> None:
         self.tile_ocr_cache = TileOcrCache()
 
+    def set_last_snapshot(self, image: Image.Image) -> None:
+        snapshot = image.copy()
+        with self.snapshot_lock:
+            previous = self.last_snapshot_image
+            self.last_snapshot_image = snapshot
+        if previous is not None:
+            previous.close()
+
+    def copy_last_snapshot(self) -> Image.Image | None:
+        with self.snapshot_lock:
+            if self.last_snapshot_image is None:
+                return None
+            return self.last_snapshot_image.copy()
+
+    def should_emit_preview(self) -> bool:
+        now = time.monotonic()
+        if now - self.last_preview_emit_at < PREVIEW_UPDATE_INTERVAL_SECONDS:
+            return False
+        self.last_preview_emit_at = now
+        return True
+
     def showEvent(self, event: Any) -> None:
         super().showEvent(event)
         set_mica(int(self.winId()))
@@ -1799,6 +1842,11 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: Any) -> None:
         self.taskbar.set_state(int(self.winId()), TBPF_NOPROGRESS)
         set_caption_color(int(self.winId()), None)
+        with self.snapshot_lock:
+            snapshot = self.last_snapshot_image
+            self.last_snapshot_image = None
+        if snapshot is not None:
+            snapshot.close()
         super().closeEvent(event)
 
     def update_monitoring_caption(self) -> None:
@@ -1913,10 +1961,13 @@ class MainWindow(QMainWindow):
         return text, "tiles", len(changed_indices)
 
     def scan_once(self, hwnd: int, word: str, match_case: bool, cooldown: int) -> None:
+        image: Image.Image | None = None
         try:
             image = capture_window(hwnd)
-            self.bridge.preview_ready.emit(image.copy())
+            if self.should_emit_preview():
+                self.bridge.preview_ready.emit(image_to_preview_qimage(image))
             text, scan_mode, changed_count = self.read_text_optimized(image)
+            self.set_last_snapshot(image)
             matched = contains_word(text, word, match_case)
             now = time.monotonic()
             should_save = matched and (not self.last_had_match or now - self.last_trigger_at >= cooldown)
@@ -1928,6 +1979,9 @@ class MainWindow(QMainWindow):
             self.bridge.completed.emit(text, screenshot_path, f"{scan_mode}:{changed_count}:{self.ocr.provider_label}")
         except Exception as exc:
             self.bridge.failed.emit(str(exc))
+        finally:
+            if image is not None:
+                image.close()
 
     def save_screenshot_image(self, image: Image.Image, word: str, ocr_text: str | None = None) -> str:
         ensure_app_dirs()
@@ -1947,7 +2001,9 @@ class MainWindow(QMainWindow):
         try:
             image = capture_window(self.selected_hwnd)
             path = self.save_screenshot_image(image, "manual")
+            self.set_last_snapshot(image)
             self.update_preview_from_image(image)
+            image.close()
             if self.history_open:
                 self.refresh_history(Path(path))
             self.start_ocr_backfill()
@@ -1957,8 +2013,12 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Saved screenshot: {path}")
 
     def update_preview_from_image(self, image: Image.Image) -> None:
-        self.last_snapshot_image = image.copy()
-        self.window_panel.set_preview(image_to_pixmap(image))
+        self.window_panel.set_preview(QPixmap.fromImage(image_to_preview_qimage(image)))
+        if self.window_panel.is_expanded():
+            self.resize_to_content()
+
+    def update_preview_from_qimage(self, image: QImage) -> None:
+        self.window_panel.set_preview(QPixmap.fromImage(image))
         if self.window_panel.is_expanded():
             self.resize_to_content()
 
