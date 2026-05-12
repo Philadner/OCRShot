@@ -1776,7 +1776,7 @@ class MainWindow(QMainWindow):
 
     def paste_snapshot_into_chatgpt(self, return_hwnd: int) -> None:
         press_hotkey(VK_CONTROL, VK_V)
-        QTimer.singleShot(260, lambda: self.submit_chatgpt_message(return_hwnd))
+        QTimer.singleShot(2000, lambda: self.submit_chatgpt_message(return_hwnd))
 
     def submit_chatgpt_message(self, return_hwnd: int) -> None:
         press_hotkey(VK_RETURN)
