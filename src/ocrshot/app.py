@@ -17,7 +17,7 @@ from typing import Any
 import numpy as np
 from PIL import Image
 from PySide6.QtCore import QEasingCurve, QObject, Property, QPropertyAnimation, QRect, QSize, QTimer, Qt, Signal
-from PySide6.QtGui import QColor, QDoubleValidator, QImage, QPainter, QPalette, QPen, QPixmap
+from PySide6.QtGui import QColor, QDoubleValidator, QImage, QMouseEvent, QPainter, QPalette, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -63,6 +63,12 @@ DWMSBT_MAINWINDOW = 2
 DWMWA_COLOR_DEFAULT = 0xFFFFFFFF
 TBPF_NOPROGRESS = 0
 TBPF_INDETERMINATE = 1
+VK_CONTROL = 0x11
+VK_SHIFT = 0x10
+VK_ESCAPE = 0x1B
+VK_V = 0x56
+VK_RETURN = 0x0D
+KEYEVENTF_KEYUP = 0x0002
 
 
 def colorref(color: QColor) -> int:
@@ -157,6 +163,10 @@ class AppConfig:
     selected_title: str = ""
     selected_process_id: int | None = None
     selected_process_name: str = ""
+    chatgpt_hwnd: int | None = None
+    chatgpt_title: str = ""
+    chatgpt_process_id: int | None = None
+    chatgpt_process_name: str = ""
     scan_interval_seconds: float = 3.0
     trigger_cooldown_seconds: float = 10.0
     match_case: bool = False
@@ -235,24 +245,32 @@ def is_selectable_window(hwnd: int) -> bool:
     return rect[2] - rect[0] > 20 and rect[3] - rect[1] > 20
 
 
-def find_remembered_window(config: AppConfig) -> int | None:
-    if config.selected_hwnd and is_selectable_window(config.selected_hwnd):
-        return config.selected_hwnd
+def find_window_by_identity(hwnd: int | None, title: str, process_name: str) -> int | None:
+    if hwnd and is_selectable_window(hwnd):
+        return hwnd
 
     candidates: list[int] = []
 
     def enum_callback(hwnd: int, _: Any) -> bool:
         if is_selectable_window(hwnd):
-            title = get_window_title(hwnd)
-            _, process_name = get_process_info(hwnd)
-            same_title = bool(config.selected_title and title == config.selected_title)
-            same_process = bool(config.selected_process_name and process_name == config.selected_process_name)
-            if same_title and (same_process or not config.selected_process_name):
+            window_title = get_window_title(hwnd)
+            _, window_process_name = get_process_info(hwnd)
+            same_title = bool(title and window_title == title)
+            same_process = bool(process_name and window_process_name == process_name)
+            if same_title and (same_process or not process_name):
                 candidates.append(hwnd)
         return True
 
     win32gui.EnumWindows(enum_callback, None)
     return candidates[0] if candidates else None
+
+
+def find_remembered_window(config: AppConfig) -> int | None:
+    return find_window_by_identity(config.selected_hwnd, config.selected_title, config.selected_process_name)
+
+
+def find_remembered_chatgpt_window(config: AppConfig) -> int | None:
+    return find_window_by_identity(config.chatgpt_hwnd, config.chatgpt_title, config.chatgpt_process_name)
 
 
 def window_from_current_cursor() -> int | None:
@@ -327,6 +345,33 @@ def capture_window(hwnd: int) -> Image.Image:
         memory_dc.DeleteDC()
         source_dc.DeleteDC()
         win32gui.ReleaseDC(hwnd, window_dc)
+
+
+def activate_window(hwnd: int) -> bool:
+    if not hwnd or not win32gui.IsWindow(hwnd):
+        return False
+    try:
+        if win32gui.IsIconic(hwnd):
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        ctypes.windll.user32.AllowSetForegroundWindow(-1)
+        win32gui.SetForegroundWindow(hwnd)
+        return True
+    except Exception:
+        try:
+            win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+            win32gui.SetForegroundWindow(hwnd)
+            return True
+        except Exception:
+            return False
+
+
+def press_hotkey(*vk_codes: int) -> None:
+    for vk_code in vk_codes:
+        ctypes.windll.user32.keybd_event(vk_code, 0, 0, 0)
+        time.sleep(0.015)
+    for vk_code in reversed(vk_codes):
+        ctypes.windll.user32.keybd_event(vk_code, 0, KEYEVENTF_KEYUP, 0)
+        time.sleep(0.015)
 
 
 def tile_boxes(size: tuple[int, int], grid: int = OCR_TILE_GRID) -> list[tuple[int, int, int, int]]:
@@ -670,11 +715,15 @@ class SelectionOverlay(QWidget):
         painter.drawRoundedRect(rect.adjusted(2, 2, -2, -2), radius - 2, radius - 2)
 
 
-def image_to_pixmap(image: Image.Image) -> QPixmap:
+def image_to_qimage(image: Image.Image) -> QImage:
     rgb = image.convert("RGBA")
     data = rgb.tobytes("raw", "RGBA")
     qimage = QImage(data, rgb.width, rgb.height, QImage.Format_RGBA8888)
-    return QPixmap.fromImage(qimage.copy())
+    return qimage.copy()
+
+
+def image_to_pixmap(image: Image.Image) -> QPixmap:
+    return QPixmap.fromImage(image_to_qimage(image))
 
 
 def virtual_desktop_geometry() -> QRect:
@@ -691,6 +740,17 @@ class SquircleFrame(QFrame):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("squircleFrame")
+
+
+class RightClickableButton(QPushButton):
+    rightClicked = Signal()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.RightButton:
+            self.rightClicked.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
 
 
 class LabeledLineEdit(SquircleFrame):
@@ -1127,10 +1187,14 @@ class MainWindow(QMainWindow):
         self.ocr = OcrEngine()
         self.bridge = MonitorBridge()
         self.selected_hwnd = find_remembered_window(self.config)
+        self.chatgpt_hwnd = find_remembered_chatgpt_window(self.config)
         self.monitoring = False
         self.scan_busy = False
         self.last_trigger_at = 0.0
         self.last_had_match = False
+        self.last_snapshot_image: Image.Image | None = None
+        self.last_external_foreground_hwnd: int | None = None
+        self.selection_purpose = "monitor"
         self.tile_ocr_cache = TileOcrCache()
         self.selection_overlay = SelectionOverlay()
         self.taskbar = TaskbarProgress()
@@ -1149,6 +1213,9 @@ class MainWindow(QMainWindow):
         self.caption_timer = QTimer(self)
         self.caption_timer.setInterval(33)
         self.caption_timer.timeout.connect(self.update_monitoring_caption)
+        self.foreground_timer = QTimer(self)
+        self.foreground_timer.setInterval(250)
+        self.foreground_timer.timeout.connect(self.track_external_foreground)
 
         self.setWindowTitle("OCRShot")
         self.setMinimumWidth(460)
@@ -1163,9 +1230,12 @@ class MainWindow(QMainWindow):
         self.start_button = QPushButton("Start Monitoring")
         self.capture_button = QPushButton("Test Capture")
         self.history_button = QPushButton("History")
+        self.send_chatgpt_button = RightClickableButton("Send to ChatGPT")
         self.start_button.setObjectName("accentButton")
         self.capture_button.setObjectName("softButton")
         self.history_button.setObjectName("softButton")
+        self.send_chatgpt_button.setObjectName("softButton")
+        self.send_chatgpt_button.setToolTip("Right click to select ChatGPT window")
 
         self.match_case_box = SquircleFrame()
         self.match_case_switch = ToggleSwitch("Match case", self.config.match_case)
@@ -1193,6 +1263,7 @@ class MainWindow(QMainWindow):
         button_row.setSpacing(8)
         button_row.addWidget(self.capture_button)
         button_row.addWidget(self.history_button)
+        button_row.addWidget(self.send_chatgpt_button)
         button_row.addStretch(1)
         button_row.addWidget(self.start_button)
 
@@ -1231,6 +1302,8 @@ class MainWindow(QMainWindow):
         self.start_button.clicked.connect(self.toggle_monitoring)
         self.capture_button.clicked.connect(self.save_manual_capture)
         self.history_button.clicked.connect(self.toggle_history)
+        self.send_chatgpt_button.clicked.connect(self.send_last_snapshot_to_chatgpt)
+        self.send_chatgpt_button.rightClicked.connect(self.begin_chatgpt_window_selection)
         self.history_panel.previousClicked.connect(self.show_previous_history)
         self.history_panel.nextClicked.connect(self.show_next_history)
         self.history_panel.deleteClicked.connect(self.delete_current_history)
@@ -1249,9 +1322,11 @@ class MainWindow(QMainWindow):
         self.window_panel.toggled.connect(lambda _expanded: self.resize_to_content())
 
         self.refresh_window_label()
+        self.refresh_chatgpt_button()
         self.statusBar().showMessage(f"Screenshots: {SCREENSHOT_DIR}")
         QTimer.singleShot(0, self.resize_to_content)
         QTimer.singleShot(800, self.start_ocr_backfill)
+        self.foreground_timer.start()
 
     def apply_theme(self) -> None:
         accent = self.accent_color
@@ -1586,27 +1661,59 @@ class MainWindow(QMainWindow):
         else:
             self.window_panel.set_window_text("No window selected")
 
+    def refresh_chatgpt_button(self) -> None:
+        if self.chatgpt_hwnd and is_selectable_window(self.chatgpt_hwnd):
+            self.send_chatgpt_button.setText("Send to ChatGPT")
+            title = get_window_title(self.chatgpt_hwnd)
+            self.send_chatgpt_button.setToolTip(f"Right click to change ChatGPT window\nCurrent: {title}")
+        elif self.config.chatgpt_title:
+            self.send_chatgpt_button.setText("Send to ChatGPT")
+            self.send_chatgpt_button.setToolTip(
+                f"Right click to select ChatGPT window\nLast used: {self.config.chatgpt_title}"
+            )
+        else:
+            self.send_chatgpt_button.setText("Send to ChatGPT")
+            self.send_chatgpt_button.setToolTip("Right click to select ChatGPT window")
+
     def persist_config(self) -> None:
         self.config.monitor_word = self.word_field.text().strip()
         self.config.selected_hwnd = self.selected_hwnd
+        self.config.chatgpt_hwnd = self.chatgpt_hwnd
         self.config.scan_interval_seconds = self.interval_input.value()
         self.config.trigger_cooldown_seconds = self.cooldown_input.value()
         self.config.match_case = self.match_case_switch.isChecked()
         if self.selected_hwnd and win32gui.IsWindow(self.selected_hwnd):
             self.config.selected_title = get_window_title(self.selected_hwnd)
             self.config.selected_process_id, self.config.selected_process_name = get_process_info(self.selected_hwnd)
+        if self.chatgpt_hwnd and win32gui.IsWindow(self.chatgpt_hwnd):
+            self.config.chatgpt_title = get_window_title(self.chatgpt_hwnd)
+            self.config.chatgpt_process_id, self.config.chatgpt_process_name = get_process_info(self.chatgpt_hwnd)
         save_config(self.config)
         if self.monitoring:
             self.scan_timer.setInterval(round(self.config.scan_interval_seconds * 1000))
 
     def begin_window_selection(self) -> None:
+        self.selection_purpose = "monitor"
         self.statusBar().showMessage("Click the window you want OCRShot to monitor...")
+        self.setWindowState(self.windowState() | Qt.WindowMinimized)
+        QTimer.singleShot(180, self.selection_overlay.start)
+
+    def begin_chatgpt_window_selection(self) -> None:
+        self.selection_purpose = "chatgpt"
+        self.statusBar().showMessage("Click the ChatGPT window OCRShot should send snapshots to...")
         self.setWindowState(self.windowState() | Qt.WindowMinimized)
         QTimer.singleShot(180, self.selection_overlay.start)
 
     def complete_window_selection(self, hwnd: int) -> None:
         self.setWindowState(self.windowState() & ~Qt.WindowMinimized)
         self.activateWindow()
+        if self.selection_purpose == "chatgpt":
+            self.chatgpt_hwnd = hwnd
+            self.persist_config()
+            self.refresh_chatgpt_button()
+            self.statusBar().showMessage("ChatGPT window selected.")
+            self.selection_purpose = "monitor"
+            return
         self.selected_hwnd = hwnd
         self.reset_ocr_scan_cache()
         self.persist_config()
@@ -1616,11 +1723,69 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self.statusBar().showMessage("Window selected.")
+        self.selection_purpose = "monitor"
 
     def cancel_window_selection(self) -> None:
         self.setWindowState(self.windowState() & ~Qt.WindowMinimized)
         self.activateWindow()
+        self.selection_purpose = "monitor"
         self.statusBar().showMessage("Window selection canceled.")
+
+    def track_external_foreground(self) -> None:
+        try:
+            hwnd = win32gui.GetForegroundWindow()
+        except Exception:
+            return
+        if not hwnd or not win32gui.IsWindow(hwnd):
+            return
+        own_hwnds = {int(self.winId()), int(self.selection_overlay.winId())}
+        if hwnd in own_hwnds:
+            return
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        if pid == os.getpid():
+            return
+        if is_selectable_window(hwnd):
+            self.last_external_foreground_hwnd = hwnd
+
+    def send_last_snapshot_to_chatgpt(self) -> None:
+        if self.last_snapshot_image is None:
+            QMessageBox.warning(self, "OCRShot", "No analyzed snapshot is available yet.")
+            return
+
+        if not self.chatgpt_hwnd or not is_selectable_window(self.chatgpt_hwnd):
+            self.chatgpt_hwnd = find_remembered_chatgpt_window(self.config)
+            if not self.chatgpt_hwnd:
+                QMessageBox.warning(self, "OCRShot", "Right click Send to ChatGPT and select the ChatGPT window first.")
+                return
+
+        return_hwnd = self.last_external_foreground_hwnd
+        if not return_hwnd or return_hwnd == self.chatgpt_hwnd or not win32gui.IsWindow(return_hwnd):
+            return_hwnd = int(self.winId())
+
+        QApplication.clipboard().setImage(image_to_qimage(self.last_snapshot_image))
+        if not activate_window(self.chatgpt_hwnd):
+            QMessageBox.warning(self, "OCRShot", "Could not focus the selected ChatGPT window.")
+            return
+
+        QTimer.singleShot(160, lambda: self.focus_chatgpt_composer(return_hwnd))
+        self.statusBar().showMessage("Sending snapshot to ChatGPT...")
+
+    def focus_chatgpt_composer(self, return_hwnd: int) -> None:
+        press_hotkey(VK_SHIFT, VK_ESCAPE)
+        QTimer.singleShot(90, lambda: self.paste_snapshot_into_chatgpt(return_hwnd))
+
+    def paste_snapshot_into_chatgpt(self, return_hwnd: int) -> None:
+        press_hotkey(VK_CONTROL, VK_V)
+        QTimer.singleShot(260, lambda: self.submit_chatgpt_message(return_hwnd))
+
+    def submit_chatgpt_message(self, return_hwnd: int) -> None:
+        press_hotkey(VK_RETURN)
+        QTimer.singleShot(140, lambda: self.restore_after_chatgpt_send(return_hwnd))
+
+    def restore_after_chatgpt_send(self, return_hwnd: int) -> None:
+        if return_hwnd and win32gui.IsWindow(return_hwnd):
+            activate_window(return_hwnd)
+        self.statusBar().showMessage("Snapshot pasted into ChatGPT.")
 
     def reset_ocr_scan_cache(self) -> None:
         self.tile_ocr_cache = TileOcrCache()
@@ -1792,6 +1957,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Saved screenshot: {path}")
 
     def update_preview_from_image(self, image: Image.Image) -> None:
+        self.last_snapshot_image = image.copy()
         self.window_panel.set_preview(image_to_pixmap(image))
         if self.window_panel.is_expanded():
             self.resize_to_content()
