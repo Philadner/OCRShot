@@ -368,6 +368,7 @@ def tile_difference(previous: np.ndarray, current: np.ndarray) -> float:
 class OcrEngine:
     def __init__(self) -> None:
         self._engine: Any | None = None
+        self._dll_directories: list[Any] = []
         self.provider_label = "unloaded"
 
     def _load(self) -> Any:
@@ -382,11 +383,11 @@ class OcrEngine:
         try:
             import onnxruntime as ort
 
-            use_cuda = "CUDAExecutionProvider" in ort.get_available_providers()
+            use_cuda = "CUDAExecutionProvider" in ort.get_available_providers() and self.preload_cuda_runtime(ort)
         except Exception:
             use_cuda = False
 
-        if use_cuda and self.has_cuda_runtime_dlls():
+        if use_cuda:
             try:
                 self._engine = RapidOCR(
                     det_use_cuda=True,
@@ -403,21 +404,61 @@ class OcrEngine:
         self.provider_label = self.active_provider_label(self._engine)
         return self._engine
 
-    def has_cuda_runtime_dlls(self) -> bool:
-        required = ("cublasLt64_12.dll", "cudnn64_9.dll")
-        path_dirs = [Path(path) for path in os.environ.get("PATH", "").split(os.pathsep) if path]
-        return all(any((path_dir / dll).exists() for path_dir in path_dirs) for dll in required)
+    def preload_cuda_runtime(self, ort: Any) -> bool:
+        self.add_nvidia_dll_directories(ort)
+        preload_dlls = getattr(ort, "preload_dlls", None)
+        if preload_dlls is None:
+            return True
+        try:
+            preload_dlls(cuda=True, cudnn=True, msvc=True)
+            return True
+        except Exception:
+            return False
+
+    def add_nvidia_dll_directories(self, ort: Any) -> None:
+        add_dll_directory = getattr(os, "add_dll_directory", None)
+        if add_dll_directory is None or self._dll_directories:
+            return
+        site_packages = Path(ort.__file__).resolve().parent.parent
+        nvidia_root = site_packages / "nvidia"
+        if not nvidia_root.exists():
+            return
+        dll_paths: list[str] = []
+        for dll_dir in sorted(nvidia_root.glob("*/bin")):
+            if dll_dir.is_dir():
+                dll_paths.append(str(dll_dir))
+                self._dll_directories.append(add_dll_directory(str(dll_dir)))
+        if dll_paths:
+            os.environ["PATH"] = os.pathsep.join(dll_paths + [os.environ.get("PATH", "")])
 
     def active_provider_label(self, engine: Any) -> str:
-        try:
-            providers = engine.text_rec.infer.session.get_providers()
-        except Exception:
-            return "CPU"
-        if providers and providers[0] == "CUDAExecutionProvider":
+        provider_sets = [
+            self.session_providers(getattr(engine, "text_det", None), ("infer", "session")),
+            self.session_providers(getattr(engine, "text_rec", None), ("session", "session")),
+            self.session_providers(getattr(engine, "text_rec", None), ("infer", "session")),
+            self.session_providers(getattr(engine, "text_cls", None), ("session", "session")),
+            self.session_providers(getattr(engine, "text_cls", None), ("infer", "session")),
+        ]
+        providers = [provider for providers in provider_sets for provider in providers]
+        if "CUDAExecutionProvider" in providers:
             return "CUDA"
         if providers:
             return providers[0].replace("ExecutionProvider", "")
         return "CPU"
+
+    def session_providers(self, root: Any, path: tuple[str, ...]) -> list[str]:
+        current = root
+        for name in path:
+            current = getattr(current, name, None)
+            if current is None:
+                return []
+        get_providers = getattr(current, "get_providers", None)
+        if get_providers is None:
+            return []
+        try:
+            return list(get_providers())
+        except Exception:
+            return []
 
     def read_text(self, image: Image.Image) -> str:
         engine = self._load()
