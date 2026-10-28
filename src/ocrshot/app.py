@@ -32,6 +32,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .backend_client import BackendClient, BackendError, png_base64_to_qimage
+
 if sys.platform == "win32":
     import winreg
 
@@ -302,7 +304,7 @@ def top_level_window_under_cursor(excluded_hwnds: set[int] | None = None) -> int
         left, top, right, bottom = win32gui.GetWindowRect(hwnd)
         if left <= cursor_x <= right and top <= cursor_y <= bottom:
             found.append(hwnd)
-            return False
+            return True
         return True
 
     win32gui.EnumWindows(enum_callback, None)
@@ -1229,11 +1231,20 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.config = load_config()
+        self.backend = BackendClient.start_default()
+        if self.backend is not None:
+            try:
+                backend_config = self.backend.call("GetConfig", timeout=8.0)
+                valid_keys = set(AppConfig.__dataclass_fields__)
+                self.config = AppConfig(**{key: value for key, value in backend_config.items() if key in valid_keys})
+            except Exception:
+                pass
         self.ocr = OcrEngine()
         self.bridge = MonitorBridge()
         self.selected_hwnd = find_remembered_window(self.config)
         self.chatgpt_hwnd = find_remembered_chatgpt_window(self.config)
         self.monitoring = False
+        self.monitoring_via_backend = False
         self.scan_busy = False
         self.last_trigger_at = 0.0
         self.last_had_match = False
@@ -1364,6 +1375,11 @@ class MainWindow(QMainWindow):
         self.bridge.failed.connect(self.handle_scan_failed)
         self.bridge.preview_ready.connect(self.update_preview_from_qimage)
         self.bridge.ocr_index_updated.connect(self.handle_ocr_index_updated)
+        if self.backend is not None:
+            self.backend.previewReady.connect(self.handle_backend_preview_ready)
+            self.backend.scanCompleted.connect(self.handle_backend_scan_completed)
+            self.backend.scanFailed.connect(self.handle_backend_scan_failed)
+            self.backend.ocrIndexUpdated.connect(self.handle_backend_ocr_index_updated)
         self.selection_overlay.selected.connect(self.complete_window_selection)
         self.selection_overlay.canceled.connect(self.cancel_window_selection)
         self.window_panel.resized.connect(self.resize_to_content)
@@ -1371,7 +1387,8 @@ class MainWindow(QMainWindow):
 
         self.refresh_window_label()
         self.refresh_chatgpt_button()
-        self.statusBar().showMessage(f"Screenshots: {SCREENSHOT_DIR}")
+        backend_label = "Go backend active" if self.backend is not None else "Python fallback active"
+        self.statusBar().showMessage(f"Screenshots: {SCREENSHOT_DIR} ({backend_label})")
         QTimer.singleShot(0, self.resize_to_content)
         QTimer.singleShot(800, self.start_ocr_backfill)
         self.foreground_timer.start()
@@ -1749,6 +1766,11 @@ class MainWindow(QMainWindow):
             self.config.chatgpt_title = get_window_title(self.chatgpt_hwnd)
             self.config.chatgpt_process_id, self.config.chatgpt_process_name = get_process_info(self.chatgpt_hwnd)
         save_config(self.config)
+        if self.backend is not None:
+            try:
+                self.backend.call("UpdateConfig", asdict(self.config), timeout=3.0)
+            except Exception:
+                pass
         if self.monitoring:
             self.scan_timer.setInterval(round(self.config.scan_interval_seconds * 1000))
 
@@ -1770,6 +1792,11 @@ class MainWindow(QMainWindow):
         if self.selection_purpose == "chatgpt":
             self.chatgpt_hwnd = hwnd
             self.persist_config()
+            if self.backend is not None:
+                try:
+                    self.backend.call("SelectChatGPTWindow", {"hwnd": hwnd}, timeout=3.0)
+                except Exception:
+                    pass
             self.refresh_chatgpt_button()
             self.statusBar().showMessage("ChatGPT window selected.")
             self.selection_purpose = "monitor"
@@ -1779,10 +1806,11 @@ class MainWindow(QMainWindow):
         self.persist_config()
         self.refresh_window_label()
         try:
-            image = capture_window(hwnd)
-            self.set_last_snapshot(image)
-            self.update_preview_from_image(image)
-            image.close()
+            if not self.capture_preview_with_backend(hwnd):
+                image = capture_window(hwnd)
+                self.set_last_snapshot(image)
+                self.update_preview_from_image(image)
+                image.close()
         except Exception:
             pass
         self.statusBar().showMessage("Window selected.")
@@ -1885,6 +1913,8 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: Any) -> None:
         self.taskbar.set_state(int(self.winId()), TBPF_NOPROGRESS)
         set_caption_color(int(self.winId()), None)
+        if self.backend is not None:
+            self.backend.shutdown()
         with self.snapshot_lock:
             snapshot = self.last_snapshot_image
             self.last_snapshot_image = None
@@ -1916,7 +1946,14 @@ class MainWindow(QMainWindow):
     def toggle_monitoring(self) -> None:
         if self.monitoring:
             self.monitoring = False
-            self.scan_timer.stop()
+            if self.monitoring_via_backend and self.backend is not None:
+                try:
+                    self.backend.call("StopMonitoring", timeout=3.0)
+                except Exception:
+                    pass
+            else:
+                self.scan_timer.stop()
+            self.monitoring_via_backend = False
             self.start_button.setText("Start Monitoring")
             self.caption_timer.stop()
             set_caption_color(int(self.winId()), None)
@@ -1932,7 +1969,23 @@ class MainWindow(QMainWindow):
             return
 
         self.persist_config()
+        if self.backend is not None:
+            try:
+                self.backend.call("StartMonitoring", asdict(self.config), timeout=8.0)
+                self.monitoring = True
+                self.monitoring_via_backend = True
+                self.last_had_match = False
+                self.monitoring_started_at = time.monotonic()
+                self.caption_timer.start()
+                self.taskbar.set_state(int(self.winId()), TBPF_INDETERMINATE)
+                self.start_button.setText("Stop Monitoring")
+                self.statusBar().showMessage("Monitoring started on Go backend.")
+                return
+            except BackendError as exc:
+                self.statusBar().showMessage(f"Go backend unavailable; using Python fallback. {exc}")
+
         self.monitoring = True
+        self.monitoring_via_backend = False
         self.last_had_match = False
         self.monitoring_started_at = time.monotonic()
         self.caption_timer.start()
@@ -2041,6 +2094,24 @@ class MainWindow(QMainWindow):
         if not self.selected_hwnd or not is_selectable_window(self.selected_hwnd):
             QMessageBox.warning(self, "OCRShot", "Select a window before capturing.")
             return
+        if self.backend is not None:
+            try:
+                result = self.backend.call(
+                    "CaptureSelected",
+                    {"hwnd": self.selected_hwnd, "word": "manual", "save": True},
+                    timeout=8.0,
+                )
+                preview = result.get("preview_png_base64")
+                if preview:
+                    self.update_preview_from_qimage(png_base64_to_qimage(preview))
+                path = result.get("screenshot_path", "")
+                if self.history_open and path:
+                    self.refresh_history(Path(path))
+                self.start_ocr_backfill()
+                self.statusBar().showMessage(f"Saved screenshot: {path}")
+                return
+            except Exception as exc:
+                self.statusBar().showMessage(f"Go capture failed; using Python fallback. {exc}")
         try:
             image = capture_window(self.selected_hwnd)
             path = self.save_screenshot_image(image, "manual")
@@ -2064,6 +2135,34 @@ class MainWindow(QMainWindow):
         self.window_panel.set_preview(QPixmap.fromImage(image))
         if self.window_panel.is_expanded():
             self.resize_to_content()
+
+    def capture_preview_with_backend(self, hwnd: int) -> bool:
+        if self.backend is None:
+            return False
+        try:
+            result = self.backend.call("CaptureSelected", {"hwnd": hwnd, "word": "preview", "save": False}, timeout=8.0)
+            preview = result.get("preview_png_base64")
+            if not preview:
+                return False
+            self.update_preview_from_qimage(png_base64_to_qimage(preview))
+            return True
+        except Exception:
+            return False
+
+    def handle_backend_preview_ready(self, payload: dict[str, Any]) -> None:
+        data = payload.get("png_base64") or payload.get("preview_png_base64")
+        if data:
+            self.update_preview_from_qimage(png_base64_to_qimage(str(data)))
+
+    def handle_backend_scan_completed(self, payload: dict[str, Any]) -> None:
+        status = f"{payload.get('scan_mode', '')}:{payload.get('changed_count', 0)}:{payload.get('provider', 'CPU')}"
+        self.handle_scan_completed(str(payload.get("text", "")), str(payload.get("screenshot_path", "")), status)
+
+    def handle_backend_scan_failed(self, payload: dict[str, Any]) -> None:
+        self.handle_scan_failed(str(payload.get("message", "Go backend scan failed.")))
+
+    def handle_backend_ocr_index_updated(self, payload: dict[str, Any]) -> None:
+        self.handle_ocr_index_updated(str(payload.get("indexed", "0")))
 
     def handle_scan_completed(self, text: str, screenshot_path: str, selected_hwnd: str) -> None:
         self.scan_busy = False

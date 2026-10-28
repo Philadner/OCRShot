@@ -7,3 +7,12 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+backend/*.exe
+
+# Rebuildable files omitted by the storage archive
+node_modules/
+.venv*/
+venv/
+__pycache__/
+.next/
+.uv-cache/
